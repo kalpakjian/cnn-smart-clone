@@ -1,0 +1,17 @@
+# 執行產物 / 暫存
+__pycache__/
+*.pyc
+*.log
+*.err
+*.pid
+
+# 本機設定: 這些檔案含網址/密鑰/資料夾 ID, public repo 絕不可進版控
+bridge_secret.txt
+bridge_url.txt
+source_id.txt
+.clasprc.json
+
+# 編輯器 / 系統
+.vscode/
+Thumbs.db
+desktop.ini

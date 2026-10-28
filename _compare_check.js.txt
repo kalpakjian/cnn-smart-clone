@@ -1,0 +1,133 @@
+﻿// compare_check.js - Google Drive 資料夾比對工具（唯讀）
+// 直接使用 clasp 的 OAuth 憑證呼叫 Drive API，
+// 比對「來源共用資料夾」與「我的備份資料夾」的實際雲端內容：
+// 資料夾結構、檔名清單、檔案數量、檔案大小（byte）。
+//
+// 使用方式：
+//   node tools/compare_check.js
+// 需求：先執行過 clasp login（~/.clasprc.json 憑證存在）
+//
+// 可用環境變數覆寫預設值：
+//   SOURCE_FOLDER_ID   來源資料夾 ID（預設：CNN 課程共用資料夾）
+//   TARGET_FOLDER_NAME 備份資料夾名稱（位於「我的雲端硬碟」根目錄，預設：CNN課程備份）
+
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const SOURCE_ID = process.env.SOURCE_FOLDER_ID || 'YOUR_SOURCE_FOLDER_ID';
+const TARGET_NAME = process.env.TARGET_FOLDER_NAME || 'CNN課程備份';
+
+async function getAccessToken() {
+  const credPath = path.join(os.homedir(), '.clasprc.json');
+  const t = JSON.parse(fs.readFileSync(credPath, 'utf8')).tokens.default;
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: t.client_id,
+      client_secret: t.client_secret,
+      refresh_token: t.refresh_token,
+      grant_type: 'refresh_token'
+    })
+  });
+  if (!res.ok) throw new Error('token refresh failed: ' + res.status);
+  return (await res.json()).access_token;
+}
+
+async function listChildren(token, folderId) {
+  const out = [];
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({
+      q: "'" + folderId + "' in parents and trashed = false",
+      pageSize: '1000',
+      fields: 'nextPageToken, files(id, name, size, mimeType)'
+    });
+    if (pageToken) params.set('pageToken', pageToken);
+    const res = await fetch('https://www.googleapis.com/drive/v3/files?' + params, {
+      headers: { Authorization: 'Bearer ' + token }
+    });
+    if (!res.ok) throw new Error('list failed: ' + res.status);
+    const j = await res.json();
+    out.push(...j.files);
+    pageToken = j.nextPageToken || null;
+  } while (pageToken);
+  return out;
+}
+
+async function walk(token, folderId, prefix, map) {
+  for (const f of await listChildren(token, folderId)) {
+    if (f.mimeType === 'application/vnd.google-apps.folder') {
+      map.folders.add(prefix + f.name + '/');
+      await walk(token, f.id, prefix + f.name + '/', map);
+    } else {
+      map.files.set(prefix + f.name, f.size ? Number(f.size) : -1);
+    }
+  }
+}
+
+async function findTargetFolder(token) {
+  const params = new URLSearchParams({
+    q: "name = '" + TARGET_NAME + "' and 'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+    fields: 'files(id, name)'
+  });
+  const res = await fetch('https://www.googleapis.com/drive/v3/files?' + params, {
+    headers: { Authorization: 'Bearer ' + token }
+  });
+  if (!res.ok) throw new Error('find target failed: ' + res.status);
+  const j = await res.json();
+  return j.files.length ? j.files[0] : null;
+}
+
+(async () => {
+  const token = await getAccessToken();
+  const target = await findTargetFolder(token);
+  if (!target) {
+    console.log('RESULT: TARGET_NOT_FOUND 找不到「' + TARGET_NAME + '」資料夾');
+    return;
+  }
+  console.log('目的地資料夾: ' + target.name + ' (id ' + target.id + ')');
+
+  const src = { files: new Map(), folders: new Set() };
+  const dst = { files: new Map(), folders: new Set() };
+  await walk(token, SOURCE_ID, '', src);
+  await walk(token, target.id, '', dst);
+
+  const missing = [], extra = [], mismatch = [];
+  for (const [name, size] of src.files) {
+    if (!dst.files.has(name)) missing.push(name);
+    else if (size !== dst.files.get(name))
+      mismatch.push(name + ' (src ' + size + ' / dst ' + dst.files.get(name) + ')');
+  }
+  for (const name of dst.files.keys()) if (!src.files.has(name)) extra.push(name);
+  const missingFolders = [...src.folders].filter(f => !dst.folders.has(f));
+  const extraFolders = [...dst.folders].filter(f => !src.folders.has(f));
+
+  const matched = src.files.size - missing.length - mismatch.length;
+  console.log('===== 雲端實際內容比對 =====');
+  console.log('來源: ' + src.files.size + ' 檔案 / ' + src.folders.size + ' 資料夾');
+  console.log('備份: ' + dst.files.size + ' 檔案 / ' + dst.folders.size + ' 資料夾');
+  console.log('完全一致檔案數: ' + matched);
+  console.log('缺少檔案: ' + missing.length + ' | 缺少資料夾: ' + missingFolders.length +
+    ' | 大小不一致: ' + mismatch.length + ' | 多餘檔案: ' + extra.length +
+    ' | 多餘資料夾: ' + extraFolders.length);
+  const cap = (arr, label) => {
+    if (arr.length === 0) return;
+    console.log('-- ' + label + ' (前20筆) --');
+    arr.slice(0, 20).forEach(x => console.log('   ' + x));
+  };
+  cap(missing, '缺少檔案');
+  cap(missingFolders, '缺少資料夾');
+  cap(mismatch, '大小不一致');
+  cap(extra, '多餘檔案');
+  cap(extraFolders, '多餘資料夾');
+
+  const done = !missing.length && !mismatch.length && !missingFolders.length &&
+    !extra.length && !extraFolders.length;
+  console.log('RESULT: ' + (done ? 'PERFECT_MATCH 完全一致' : 'DIFFERENCES_FOUND 有差異，同步尚未完成'));
+})().catch(e => {
+  console.error('ERROR: ' + e.message);
+  process.exit(1);
+});

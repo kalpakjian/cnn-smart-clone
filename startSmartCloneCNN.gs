@@ -1,0 +1,292 @@
+// ---- 本次同步的統計 (供 Web App 橋接回報用) ----
+var CLONE_STATS = { added: 0, updated: 0, broken: 0, skipped: 0 };
+
+function resetCloneStats() {
+  CLONE_STATS.added = 0;
+  CLONE_STATS.updated = 0;
+  CLONE_STATS.broken = 0;
+  CLONE_STATS.skipped = 0;
+}
+
+function startSmartCloneCNN() {
+  // 0. 防止「手動執行」與「自動排程」同時跑造成重複複製
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log("⏳ 另一個同步正在執行中，本次自動跳過");
+    return;
+  }
+
+  try {
+    resetCloneStats();
+    // 1. CNN 共用資料夾 ID -> 放在 Script Properties (不寫死在程式碼裡)
+    var sourceFolderId = PropertiesService.getScriptProperties().getProperty('SOURCE_FOLDER_ID');
+    if (!sourceFolderId) {
+      throw new Error('尚未設定 Script Property SOURCE_FOLDER_ID (見 cloneBridge.gs 檔頭的 bootstrap 說明)');
+    }
+
+    // 2. 目的地資料夾名稱（自動在我的雲端硬碟建立，已存在就沿用）
+    var targetName = "CNN課程備份";
+
+    var sourceFolder = DriveApp.getFolderById(sourceFolderId);
+
+    // --- 自動建立 / 取得目的地資料夾（免手動建資料夾、免複製 ID）---
+    var targetFolder = null;
+    var rootFolders = DriveApp.getRootFolder().getFolders();
+    while (rootFolders.hasNext()) {
+      var f = rootFolders.next();
+      if (f.getName() === targetName) {
+        targetFolder = f;
+        break;
+      }
+    }
+    if (targetFolder === null) {
+      targetFolder = DriveApp.getRootFolder().createFolder(targetName);
+      Logger.log("📂 已自動建立目的地資料夾: " + targetName);
+    } else {
+      Logger.log("📂 使用既有的目的地資料夾: " + targetName);
+    }
+    Logger.log("🔗 目的地資料夾連結: " + targetFolder.getUrl());
+
+    Logger.log("🚀 開始智慧同步（已存在的同名檔案會自動比對新舊）...");
+    copyFolderSmart(sourceFolder, targetFolder);
+    Logger.log("🎉 智慧同步完成！新增 " + CLONE_STATS.added + " / 取代 " + CLONE_STATS.updated +
+               " / 修復壞檔 " + CLONE_STATS.broken + " / 跳過 " + CLONE_STATS.skipped);
+
+    // 全部完成 → 自動關閉自動排程（若有的話）
+    cleanupAutoRetry();
+    Logger.log("⏰ 自動排程已關閉（若之前有開啟）。以後想再同步，重新執行即可。");
+    return CLONE_STATS;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------- 自動續跑小幫手 ----------
+// 在編輯器選單選 installAutoRetry 按一次「執行」，
+// 之後每 10 分鐘自動同步一次，全部完成後會自動關閉自己。
+
+function installAutoRetry() {
+  cleanupAutoRetry(); // 先清掉舊排程，避免重複建立
+  ScriptApp.newTrigger("startSmartCloneCNN").timeBased().everyMinutes(10).create();
+  Logger.log("⏰ 自動排程已啟動：每 10 分鐘自動同步一次，全部完成後會自動關閉。可以放心關掉瀏覽器了！");
+}
+
+function cleanupAutoRetry() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    ScriptApp.deleteTrigger(triggers[i]);
+  }
+}
+
+// ============================================================
+// 備份比對工具：verifyCNNBackup
+// 在編輯器函式選單選 verifyCNNBackup 按「執行」，
+// 逐一比對老師的 CNN 資料夾與你自己的「CNN課程備份」：
+// 資料夾結構、檔名清單、檔案數量、檔案大小。
+// 結果顯示在下方執行記錄。唯讀、不修改任何檔案，可重複執行。
+// ============================================================
+
+function verifyCNNBackup() {
+  var sourceFolderId = PropertiesService.getScriptProperties().getProperty('SOURCE_FOLDER_ID');
+  var targetName = "CNN課程備份";
+
+  var sourceFolder = DriveApp.getFolderById(sourceFolderId);
+
+  // 找目的地資料夾（與 startSmartCloneCNN 相同邏輯）
+  var targetFolder = null;
+  var rootFolders = DriveApp.getRootFolder().getFolders();
+  while (rootFolders.hasNext()) {
+    var f = rootFolders.next();
+    if (f.getName() === targetName) {
+      targetFolder = f;
+      break;
+    }
+  }
+  if (targetFolder === null) {
+    Logger.log("❌ 找不到目的地資料夾「" + targetName + "」，請先執行 startSmartCloneCNN 完成備份。");
+    return;
+  }
+
+  var report = {
+    foldersChecked: 0,
+    filesMatched: 0,
+    missingFiles: [],    // 來源有、備份缺
+    extraFiles: [],      // 備份多出來的
+    sizeMismatch: [],    // 同名但大小不同
+    missingFolders: [],
+    extraFolders: [],
+    issueCount: 0,
+    maxIssues: 100       // 每類最多列出 100 筆，避免執行記錄過長
+  };
+
+  Logger.log("🔍 開始比對：「" + sourceFolder.getName() + "」 vs 「" + targetName + "」");
+  compareFolderCNN(sourceFolder, targetFolder, "", report);
+
+  // ---- 印出比對結果 ----
+  Logger.log("");
+  Logger.log("========== 📊 比對結果 ==========");
+  Logger.log("📁 檢查資料夾數: " + report.foldersChecked);
+  Logger.log("📄 完全一致的檔案數: " + report.filesMatched);
+  verifyPrintIssues("備份缺少的檔案（來源有、備份沒有）", report.missingFiles);
+  verifyPrintIssues("備份多出來的檔案（來源沒有）", report.extraFiles);
+  verifyPrintIssues("大小不一致的檔案（同名但 bytes 不同）", report.sizeMismatch);
+  verifyPrintIssues("備份缺少的資料夾", report.missingFolders);
+  verifyPrintIssues("備份多出來的資料夾", report.extraFolders);
+
+  if (report.issueCount === 0) {
+    Logger.log("🎉 結論：完全一致！老師的資料夾與你的備份內容相同。");
+  } else {
+    Logger.log("⚠️ 結論：共發現 " + report.issueCount + " 個差異（每類最多列出 " + report.maxIssues + " 筆）。");
+    Logger.log("👉 建議：先執行 startSmartCloneCNN 補齊，再跑一次 verifyCNNBackup 確認歸零。");
+  }
+}
+
+function compareFolderCNN(source, target, path, report) {
+  report.foldersChecked++;
+
+  // --- 檔案比對：檔名 + 大小 ---
+  var sourceFiles = {}; // 檔名 -> 大小(bytes)
+  var it = source.getFiles();
+  while (it.hasNext()) {
+    var sf = it.next();
+    sourceFiles[sf.getName()] = sf.getSize();
+  }
+  var targetFiles = {};
+  it = target.getFiles();
+  while (it.hasNext()) {
+    var tf = it.next();
+    targetFiles[tf.getName()] = tf.getSize();
+  }
+
+  for (var name in sourceFiles) {
+    if (!(name in targetFiles)) {
+      verifyAddIssue(report, report.missingFiles, path + name);
+    } else if (sourceFiles[name] !== targetFiles[name]) {
+      verifyAddIssue(report, report.sizeMismatch,
+        path + name + "（來源 " + sourceFiles[name] + " bytes / 備份 " + targetFiles[name] + " bytes）");
+    } else {
+      report.filesMatched++;
+    }
+  }
+  for (var name2 in targetFiles) {
+    if (!(name2 in sourceFiles)) {
+      verifyAddIssue(report, report.extraFiles, path + name2);
+    }
+  }
+
+  // --- 資料夾比對：遞迴往下 ---
+  var sourceFolders = {};
+  it = source.getFolders();
+  while (it.hasNext()) {
+    var sd = it.next();
+    sourceFolders[sd.getName()] = sd;
+  }
+  var targetFolders = {};
+  it = target.getFolders();
+  while (it.hasNext()) {
+    var td = it.next();
+    targetFolders[td.getName()] = td;
+  }
+
+  for (var dName in sourceFolders) {
+    if (!(dName in targetFolders)) {
+      verifyAddIssue(report, report.missingFolders, path + dName + "/");
+    } else {
+      compareFolderCNN(sourceFolders[dName], targetFolders[dName], path + dName + "/", report);
+    }
+  }
+  for (var dName2 in targetFolders) {
+    if (!(dName2 in sourceFolders)) {
+      verifyAddIssue(report, report.extraFolders, path + dName2 + "/");
+    }
+  }
+}
+
+function verifyAddIssue(report, list, text) {
+  report.issueCount++;
+  if (list.length < report.maxIssues) {
+    list.push(text);
+  }
+}
+
+function verifyPrintIssues(title, list) {
+  if (list.length === 0) {
+    Logger.log("✅ " + title + "：0 筆");
+  } else {
+    Logger.log("⚠️ " + title + "：" + list.length + " 筆");
+    for (var i = 0; i < list.length; i++) {
+      Logger.log("   - " + list[i]);
+    }
+  }
+}
+
+function copyFolderSmart(source, target) {
+  // --- 1. 處理檔案複製（防重複，且會自動取代「已更新」的同名舊檔）---
+  // 先把目的地資料夾裡「檔名 -> 檔案物件」建成索引，方便之後比對
+  var existingFiles = {};
+  var targetFiles = target.getFiles();
+  while (targetFiles.hasNext()) {
+    var f = targetFiles.next();
+    existingFiles[f.getName()] = f;
+  }
+
+  var sourceFiles = source.getFiles();
+  while (sourceFiles.hasNext()) {
+    var file = sourceFiles.next();
+    var fileName = file.getName();
+
+    if (existingFiles[fileName]) {
+      // 同名檔案已存在：
+      //   (1) 備份是壞掉的 0 byte 空檔案（例如被只讀中繼資料的工具錯誤建立）→ 一定要重新複製
+      //   (2) 備份大小與來源不符（內容不完整／被其他工具換掉）→ 一定要重新複製
+      //       註: 這類壞檔的「修改時間」往往比來源新，只比時間會永遠跳過，所以必須比對大小。
+      //   (3) 來源比備份新 → 取代舊檔
+      var oldFile = existingFiles[fileName];
+      var srcSize = Number(file.getSize());
+      var dstSize = Number(oldFile.getSize());
+      var isBroken = (srcSize > 0 && dstSize !== srcSize);
+      if (isBroken || file.getLastUpdated().getTime() > oldFile.getLastUpdated().getTime()) {
+        Logger.log((isBroken ? "🩹 備份內容不完整，重新複製: " : "🔄 檔案有更新，取代舊檔: ") + fileName);
+        oldFile.setTrashed(true);
+        file.makeCopy(fileName, target);
+        if (isBroken) {
+          CLONE_STATS.broken++;
+        } else {
+          CLONE_STATS.updated++;
+        }
+      } else {
+        Logger.log("跳過已存在的檔案: " + fileName);
+        CLONE_STATS.skipped++;
+      }
+    } else {
+      Logger.log("➕ 複製新檔案: " + fileName);
+      file.makeCopy(fileName, target);
+      CLONE_STATS.added++;
+    }
+  }
+
+  // --- 2. 處理子資料夾複製（防重複且支援無限層級）---
+  var existingFolders = {};
+  var targetFolders = target.getFolders();
+  while (targetFolders.hasNext()) {
+    var folder = targetFolders.next();
+    existingFolders[folder.getName()] = folder;
+  }
+
+  var sourceFolders = source.getFolders();
+  while (sourceFolders.hasNext()) {
+    var subFolder = sourceFolders.next();
+    var folderName = subFolder.getName();
+    var nextTargetFolder;
+
+    if (existingFolders[folderName]) {
+      Logger.log("進入已存在的資料夾: " + folderName);
+      nextTargetFolder = existingFolders[folderName];
+    } else {
+      Logger.log("📂 建立新資料夾: " + folderName);
+      nextTargetFolder = target.createFolder(folderName);
+    }
+
+    copyFolderSmart(subFolder, nextTargetFolder);
+  }
+}
