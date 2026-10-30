@@ -6,9 +6,11 @@ __pycache__/
 *.pid
 
 # 本機設定: 這些檔案含網址/密鑰/資料夾 ID, public repo 絕不可進版控
-bridge_secret.txt
-bridge_url.txt
-source_id.txt
+# 用 * 涵蓋備份檔 (例如 bridge_secret.txt.bak-20261030), 否則會漏掉
+bridge_secret.txt*
+bridge_url.txt*
+source_id.txt*
+*.bak-*
 .clasprc.json
 
 # 編輯器 / 系統
